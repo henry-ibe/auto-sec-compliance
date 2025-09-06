@@ -1,0 +1,34 @@
+name: publish-report
+
+on:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  REPORTS_BUCKET: auto-sec-reports-1757193665
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::782781395980:role/GitHubOIDCRole
+          aws-region: us-east-1
+
+      - name: Who am I (debug)
+        run: aws sts get-caller-identity
+
+      - name: Publish compliance report to S3
+        run: |
+          mkdir -p site/latest
+          echo '<h1>CI Report</h1>' > site/latest/ci-report.html
+          aws s3 cp site/latest/ci-report.html s3://$REPORTS_BUCKET/latest/ci-report.html \
+            --content-type text/html --cache-control "max-age=60"
