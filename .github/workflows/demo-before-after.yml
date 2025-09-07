@@ -1,6 +1,10 @@
 name: Demo (ephemeral EC2) - Before/After
 on:
-  workflow_dispatch: {}   # <-- this is the key bit GitHub needs
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+    paths:
+      - .github/trigger/run-demo    # touching this file triggers the demo
 
 permissions:
   id-token: write
@@ -117,7 +121,7 @@ jobs:
 
           sudo dnf -y install awscli || sudo yum -y install awscli || true
           sudo dnf -y install jq python3 openscap openscap-scanner scap-security-guide || sudo yum -y install jq python3 openscap openscap-scanner scap-security-guide || true
-          curl -sL https://downloads.cisofy.com/lynis/lynis-3.0.9.tar.gz | sudo tar xz -C /opt || true
+          curl -sL https://downloads.cisofy.com/lynis/lynis/lynis-3.0.9.tar.gz | sudo tar xz -C /opt || true
           sudo ln -sf /opt/lynis/lynis /usr/local/bin/lynis || true
           mkdir -p /tmp/reports
 
