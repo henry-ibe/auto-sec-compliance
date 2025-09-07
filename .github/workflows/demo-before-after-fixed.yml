@@ -1,3 +1,4 @@
+tee demo-before-after-fixed.yml >/dev/null <<'YAML'
 name: "Demo (ephemeral EC2) — Before/After"
 
 on:
@@ -50,7 +51,7 @@ jobs:
           echo "id=$AMI" >> "$GITHUB_OUTPUT"
           echo "Using AMI=$AMI"
 
-      # Launch with **public IP** so SSM can reach it
+      # Launch with public IP so SSM can reach it
       - name: Launch t3.micro with instance profile (public IP)
         id: launch
         shell: bash
@@ -288,6 +289,7 @@ jobs:
           aws s3 cp summarize_json.py        "s3://${BUCKET}/${KEY_PREFIX}/summarize_json.py" --region "${REGION}"
           aws s3 cp remote_demo.sh           "s3://${BUCKET}/${KEY_PREFIX}/remote_demo.sh" --region "${REGION}"
 
+      # JSON parameters + S3 output capture for reliable logs
       - name: Run demo remotely via SSM
         id: run
         shell: bash
@@ -298,28 +300,43 @@ jobs:
         run: |
           set -euo pipefail
           echo "Target $IID"
-          read -r -d '' CMDS <<'EOS'
-          sudo dnf -y install awscli || sudo yum -y install awscli || true
-          aws s3 cp "s3://$BUCKET/$KEY_PREFIX/remote_demo.sh" /tmp/remote_demo.sh --region "$AWS_REGION"
-          sudo env BUCKET="$BUCKET" REGION="$AWS_REGION" RUN="$RUN" KEY_PREFIX="$KEY_PREFIX" METRIC_NAMESPACE="$METRIC_NAMESPACE" bash /tmp/remote_demo.sh
-          EOS
+
+          PARAMS=$(jq -n \
+            --arg c1 'sudo dnf -y install awscli || sudo yum -y install awscli || true' \
+            --arg c2 "aws s3 cp \"s3://$BUCKET/$KEY_PREFIX/remote_demo.sh\" /tmp/remote_demo.sh --region \"$AWS_REGION\"" \
+            --arg c3 "sudo env BUCKET=\"$BUCKET\" REGION=\"$AWS_REGION\" RUN=\"$RUN\" KEY_PREFIX=\"$KEY_PREFIX\" METRIC_NAMESPACE=\"$METRIC_NAMESPACE\" bash /tmp/remote_demo.sh" \
+            '{commands: [$c1,$c2,$c3]}')
+
+          OUT_PREFIX="$RUN/ssm-output/$IID"
+
+          set -x
           CMD_ID=$(aws ssm send-command \
             --document-name "AWS-RunShellScript" \
             --instance-ids "$IID" \
             --comment "Before/After demo $RUN" \
-            --parameters "commands=$CMDS" \
+            --parameters "$PARAMS" \
+            --output-s3-bucket-name "$BUCKET" \
+            --output-s3-key-prefix "$OUT_PREFIX" \
             --query "Command.CommandId" --output text)
+          set +x
           echo "cmd_id=$CMD_ID" >> "$GITHUB_OUTPUT"
 
+          STATUS=""
           for _ in $(seq 1 90); do
             STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --query Status --output text || true)
             echo "SSM status: $STATUS"
             [[ "$STATUS" =~ ^(Success|Failed|Cancelled|TimedOut)$ ]] && break
             sleep 5
           done
-          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --output json > demo-ssm-out.json
+
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --output json > demo-ssm-out.json || true
           jq -r '.StandardOutputContent' demo-ssm-out.json > demo-stdout.txt || true
-          jq -r '.StandardErrorContent'  demo-ssm-out.json > demo-stderr.txt || true
+          jq -r '.StandardErrorContent'  demo-ssm-out.json > demo-stderr.txt  || true
+
+          # Also fetch S3-captured logs
+          aws s3 cp "s3://$BUCKET/$OUT_PREFIX/awsrunShellScript/0.awsrunShellScript/stdout" demo-stdout.s3.txt --region "$AWS_REGION" || true
+          aws s3 cp "s3://$BUCKET/$OUT_PREFIX/awsrunShellScript/0.awsrunShellScript/stderr" demo-stderr.s3.txt --region "$AWS_REGION" || true
+
           test "$STATUS" = "Success" || { echo "::error::remote demo failed"; exit 1; }
 
       - name: Download summaries from S3 (for artifact)
@@ -343,6 +360,8 @@ jobs:
             demo-ssm-out.json
             demo-stdout.txt
             demo-stderr.txt
+            demo-stdout.s3.txt
+            demo-stderr.s3.txt
             demo-artifacts/summary-before.json
             demo-artifacts/summary-after.json
           if-no-files-found: warn
@@ -362,3 +381,4 @@ jobs:
           else
             echo "No instance id to terminate."
           fi
+
