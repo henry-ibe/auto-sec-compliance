@@ -22,7 +22,6 @@ env:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -61,7 +60,6 @@ jobs:
           IID="${{ steps.target.outputs.iid }}"
           RUN=$(date -u +%Y%m%dT%H%M%SZ)
 
-          # --- Playbook (same one you ran manually)
           PB_CONTENT=$(cat <<'PYAML'
 - name: Baseline + Scan + Collect
   hosts: localhost
@@ -141,7 +139,6 @@ PYAML
 )
           PB64=$(printf "%s" "$PB_CONTENT" | base64 -w0)
 
-          # --- summarize_json.py
           SUM_CONTENT=$(cat <<'PY'
 #!/usr/bin/env python3
 import os, re, sys, json, socket, datetime
@@ -189,7 +186,6 @@ PY
 )
           SUM64=$(printf "%s" "$SUM_CONTENT" | base64 -w0)
 
-          # --- publish_to_s3.sh
           PUB_CONTENT=$(cat <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -203,35 +199,20 @@ BASH
 )
           PUB64=$(printf "%s" "$PUB_CONTENT" | base64 -w0)
 
-          # --- Commands executed on the instance via SSM
           read -r -d '' CMDS <<EOF || true
 set -euo pipefail
 export PATH="\$HOME/.local/bin:\$PATH"
 mkdir -p /tmp/reports \$HOME/scripts
-
-# Ensure Ansible present for the user
 if ! command -v ansible-playbook >/dev/null 2>&1; then pip3 install --user ansible; fi
-
-# Drop files
 echo "$PB64"  | base64 -d > /tmp/playbook.yml
 echo "$SUM64" | base64 -d > /tmp/summarize_json.py; chmod +x /tmp/summarize_json.py
 echo "$PUB64" | base64 -d > \$HOME/scripts/publish_to_s3.sh; chmod +x \$HOME/scripts/publish_to_s3.sh
-
-# Run playbook locally
 sudo ansible-playbook -i "localhost," -c local --become /tmp/playbook.yml
-
-# Build summary.json
-export BUCKET="${{ env.BUCKET }}"; export REGION="${{ env.AWS_REGION }}"; export RUN="$RUN"; export PHASE="${{ env.PHASE }}"
+export BUCKET="${{ env.BUCKET }}"; export REGION="${{ env.AWS_REGION }}"; RUN=$(date -u +%Y%m%dT%H%M%SZ); export RUN; export PHASE="${{ env.PHASE }}"
 python3 /tmp/summarize_json.py /tmp/reports/lynis-report.dat /tmp/reports/openscap-results.xml /tmp/reports/summary.json
 chmod -R a+r /tmp/reports
-
-# Publish
 \$HOME/scripts/publish_to_s3.sh
-
-# Return summary JSON in stdout
-echo '---SUMMARY-JSON---'
-cat /tmp/reports/summary.json
-echo '---END-SUMMARY---'
+echo '---SUMMARY-JSON---'; cat /tmp/reports/summary.json; echo '---END-SUMMARY---'
 EOF
 
           PARAMS=$(jq -cn --arg cmds "$CMDS" '{commands: ($cmds|split("\n"))}')
@@ -241,7 +222,6 @@ EOF
             --comment "Compliance scan $RUN" \
             --parameters "$PARAMS" \
             --query 'Command.CommandId' --output text)
-
           echo "cmd=$CMD_ID" >> "$GITHUB_OUTPUT"
           echo "run=$RUN"     >> "$GITHUB_OUTPUT"
 
