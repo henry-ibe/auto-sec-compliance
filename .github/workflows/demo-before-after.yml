@@ -1,6 +1,7 @@
-name: Demo (ephemeral EC2) — Before/After
+name: Demo (ephemeral EC2) - Before/After
 on:
-  workflow_dispatch: {}
+  workflow_dispatch: {}   # <-- this is the key bit GitHub needs
+
 permissions:
   id-token: write
   contents: read
@@ -157,7 +158,7 @@ jobs:
             oscap xccdf eval --profile xccdf_org.ssgproject.content_profile_standard \
               --results /tmp/reports/openscap-results.xml \
               --report  /tmp/reports/openscap-report.html \
-              /usr/share/xml/scap/ssg-amazon_linux_2023-xccdf.xml
+              /usr/share/xml/scap/ssg/content/ssg-amazon_linux_2023-xccdf.xml
             python3 /tmp/summarize_json.py > /tmp/reports/summary.json
             aws s3 cp /tmp/reports "s3://$BUCKET/$RUN/$STAGE/" --recursive --region "$REGION"
             J=$(cat /tmp/reports/summary.json)
