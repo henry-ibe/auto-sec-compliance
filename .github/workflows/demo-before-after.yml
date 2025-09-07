@@ -1,358 +1,251 @@
-name: "Demo (ephemeral EC2) — Before/After"
-
+name: Demo (ephemeral EC2) — Before/After
 on:
   workflow_dispatch: {}
-
 permissions:
   id-token: write
   contents: read
-
 env:
   AWS_REGION: us-east-1
-  AWS_DEFAULT_REGION: us-east-1
-  BUCKET: ${{ vars.BUCKET }}                 # e.g. auto-sec-reports-1757193665
-  ROLE_ARN: ${{ vars.ROLE_ARN }}             # e.g. arn:aws:iam::<acct>:role/GitHubOIDCRole
-  DEMO_IAM_PROFILE: ${{ vars.DEMO_IAM_PROFILE }}  # e.g. DemoTargetRole
+  REPORTS_BUCKET: auto-sec-reports-1757193665
+  METRIC_NAMESPACE: ComplianceMetrics
+  REPO_NAME: henry-ibe/auto-sec-compliance
+  DEMO_IAM_PROFILE: DemoTargetRole
 
 jobs:
   demo:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Ensure CLI deps (jq, unzip)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq unzip
+      - name: Ensure CLI deps (jq)
+        run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: arn:aws:iam::782781395980:role/GitHubOIDCRole
           aws-region: ${{ env.AWS_REGION }}
-          audience: sts.amazonaws.com
-          output-env-credentials: true
 
-      # AMI via SSM parameter (no ec2:DescribeImages needed)
       - name: Resolve latest AL2023 AMI (x86_64)
         id: ami
-        shell: bash
         run: |
-          set -euo pipefail
-          AMI=$(aws ssm get-parameter \
-            --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
-            --query 'Parameter.Value' --output text)
-          [ -n "$AMI" ] || { echo "No AMI from SSM param"; exit 1; }
+          AMI=$(aws ec2 describe-images \
+            --owners 137112412989 \
+            --filters "Name=name,Values=al2023-ami-*-x86_64" "Name=state,Values=available" \
+            --query "reverse(sort_by(Images,&CreationDate))[0].ImageId" --output text)
           echo "id=$AMI" >> "$GITHUB_OUTPUT"
-          echo "Using AMI=$AMI"
+          echo "Using AMI: $AMI"
 
-      - name: Launch t3.micro with instance profile
+      - name: Launch t3.micro with public IP in default VPC
         id: launch
         shell: bash
         env:
           AMI: ${{ steps.ami.outputs.id }}
         run: |
           set -euo pipefail
-          PROFILE="${DEMO_IAM_PROFILE:-DemoTargetRole}"
-          echo "Using IAM instance profile: $PROFILE"
+          VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query "Vpcs[0].VpcId" --output text)
+          [ "$VPC" != "None" ] || { echo "::error::No default VPC"; exit 1; }
+
+          # Try a public subnet first, else default-for-az (we also force associate-public-ip)
+          SUBNET=$(aws ec2 describe-subnets \
+            --filters Name=vpc-id,Values="$VPC" Name=map-public-ip-on-launch,Values=true \
+            --query "Subnets[0].SubnetId" --output text)
+          if [ "$SUBNET" = "None" ] || [ -z "$SUBNET" ]; then
+            SUBNET=$(aws ec2 describe-subnets \
+              --filters Name=vpc-id,Values="$VPC" Name=default-for-az,Values=true \
+              --query "Subnets[0].SubnetId" --output text)
+          fi
+          [ "$SUBNET" != "None" ] && [ -n "$SUBNET" ] || { echo "::error::No subnet"; exit 1; }
+
+          SG=$(aws ec2 describe-security-groups \
+            --filters Name=vpc-id,Values="$VPC" Name=group-name,Values=default \
+            --query "SecurityGroups[0].GroupId" --output text)
+          [ "$SG" != "None" ] || { echo "::error::No default SG"; exit 1; }
+
           IID=$(aws ec2 run-instances \
             --image-id "$AMI" \
             --instance-type t3.micro \
-            --iam-instance-profile "Name=$PROFILE" \
+            --iam-instance-profile "Name=$DEMO_IAM_PROFILE" \
+            --subnet-id "$SUBNET" \
+            --security-group-ids "$SG" \
+            --associate-public-ip-address \
             --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=BeforeAfterDemo}]' \
-            --query 'Instances[0].InstanceId' --output text)
-          [ -n "$IID" ] && [ "$IID" != "None" ] || { echo "Launch failed"; exit 1; }
+            --query "Instances[0].InstanceId" --output text)
           echo "iid=$IID" >> "$GITHUB_OUTPUT"
-          echo "Launched $IID"
+          echo "Launched: $IID"
 
-      - name: Wait for EC2 running
-        shell: bash
-        env:
-          IID: ${{ steps.launch.outputs.iid }}
-        run: |
-          set -euo pipefail
           aws ec2 wait instance-running --instance-ids "$IID"
-          echo "Instance $IID is running"
+          PUBIP=$(aws ec2 describe-instances --instance-ids "$IID" --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+          echo "Public IP: $PUBIP"
+          if [ "$PUBIP" = "None" ] || [ -z "$PUBIP" ]; then
+            echo "::error::Instance has no public IP (check IGW/route or use VPC endpoints for SSM)."; exit 1;
+          fi
 
       - name: Wait for SSM Online
-        id: ssmwait
+        id: wait
         shell: bash
         env:
           IID: ${{ steps.launch.outputs.iid }}
         run: |
           set -euo pipefail
-          for i in $(seq 1 60); do
-            STATUS=$(aws ssm describe-instance-information \
-              --filters "Key=InstanceIds,Values=$IID" \
-              --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)
-            if [ "$STATUS" = "Online" ]; then
-              echo "SSM Online after $i checks"
-              exit 0
-            fi
-            sleep 5
+          for i in {1..30}; do
+            online=$(aws ssm describe-instance-information \
+              --query "InstanceInformationList[?InstanceId=='$IID'] | length(@)" --output text)
+            [ "$online" = "1" ] && { echo "SSM online"; exit 0; } || sleep 10
           done
-          echo "SSM did not become Online in time" >&2
-          exit 1
+          echo "::error::SSM never became online for $IID"; exit 1
 
-      - name: Build scripts and stage to S3
-        id: stage
+      - name: Upload inline demo script via SSM
+        id: upload
         shell: bash
         env:
-          REGION: ${{ env.AWS_REGION }}
+          IID: ${{ steps.launch.outputs.iid }}
         run: |
           set -euo pipefail
-          RUN=$(date -u +%Y%m%dT%H%M%SZ)
-          echo "run=$RUN" >> "$GITHUB_OUTPUT"
-
-          # --- make_noncompliant.sh ---
-          cat > make_noncompliant.sh <<'BASH'
+          cat > demo.sh <<'BASH'
           #!/usr/bin/env bash
           set -euo pipefail
-          sshd_cfg=/etc/ssh/sshd_config
-          backup=/etc/ssh/sshd_config.demo.bak
-          [ -f "$backup" ] || cp -p "$sshd_cfg" "$backup" || true
-          if grep -qE '^\s*PasswordAuthentication' "$sshd_cfg"; then
-            sed -i 's/^\s*PasswordAuthentication.*/PasswordAuthentication yes/' "$sshd_cfg"
-          else
-            echo 'PasswordAuthentication yes' >> "$sshd_cfg"
-          fi
-          if grep -qE '^\s*PermitRootLogin' "$sshd_cfg"; then
-            sed -i 's/^\s*PermitRootLogin.*/PermitRootLogin yes/' "$sshd_cfg"
-          else
-            echo 'PermitRootLogin yes' >> "$sshd_cfg"
-          fi
-          grep -q '^Ciphers' "$sshd_cfg" || echo 'Ciphers aes128-cbc,3des-cbc' >> "$sshd_cfg" || true
-          (systemctl disable --now firewalld || true)
-          (systemctl disable --now nftables || true)
-          (systemctl disable --now iptables || true)
-          (systemctl disable --now auditd || true)
-          (dnf -y remove fail2ban || yum -y remove fail2ban || true) >/dev/null 2>&1 || true
-          echo 'umask 000' >/etc/profile.d/99-umask.sh
-          install -m 0777 -D /dev/null /tmp/ww.demo.file
-          install -m 0666 -D /etc/hosts /etc/hosts.demo.insecure || true
-          (systemctl restart sshd || systemctl restart ssh || true)
-          BASH
-          chmod +x make_noncompliant.sh
+          REGION="${1:?region}"
+          BUCKET="${2:?bucket}"
+          REPO="${3:?repo}"
+          BRANCH="${4:?branch}"
+          NS="${5:?namespace}"
+          RUN="${6:?run}"
 
-          # --- remediate_and_harden.sh ---
-          cat > remediate_and_harden.sh <<'BASH'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          sshd_cfg=/etc/ssh/sshd_config
-          [ -f /etc/ssh/sshd_config.demo.bak ] && cp -p /etc/ssh/sshd_config.demo.bak "$sshd_cfg" || true
-          if grep -qE '^\s*PasswordAuthentication' "$sshd_cfg"; then
-            sed -i 's/^\s*PasswordAuthentication.*/PasswordAuthentication no/' "$sshd_cfg"
-          else
-            echo 'PasswordAuthentication no' >> "$sshd_cfg"
-          fi
-          if grep -qE '^\s*PermitRootLogin' "$sshd_cfg"; then
-            sed -i 's/^\s*PermitRootLogin.*/PermitRootLogin no/' "$sshd_cfg"
-          else
-            echo 'PermitRootLogin no' >> "$sshd_cfg"
-          fi
-          sed -i '/^Ciphers aes128-cbc,3des-cbc/d' "$sshd_cfg" || true
-          if grep -qE '^\s*LogLevel' "$sshd_cfg"; then
-            sed -i 's/^\s*LogLevel.*/LogLevel VERBOSE/' "$sshd_cfg"
-          else
-            echo 'LogLevel VERBOSE' >> "$sshd_cfg"
-          fi
-          echo 'umask 027' >/etc/profile.d/99-umask.sh
-          (dnf -y install firewalld audit fail2ban || yum -y install firewalld audit fail2ban || true)
-          (systemctl enable --now firewalld || true)
-          (systemctl enable --now auditd || true)
-          (systemctl enable --now fail2ban || true)
-          (dnf -y update || yum -y update || true)
-          (systemctl restart sshd || systemctl restart ssh || true)
-          BASH
-          chmod +x remediate_and_harden.sh
+          log(){ echo "[$(date -u +%FT%TZ)] $*"; }
 
-          # --- summarize_json.py ---
-          cat > summarize_json.py <<'PY'
-          import json, os, re, sys
-          from datetime import datetime, timezone
-          def r(p):
-              try: return open(p, encoding="utf-8", errors="ignore").read()
-              except: return ""
-          def idx(t):
-              m = re.search(r'hardening[_ ]index[^0-9]*([0-9]{1,3})', t, re.I)
-              return int(m.group(1)) if m else 0
-          def score(x):
-              m = re.search(r'score="([0-9]+(?:\\.[0-9]+)?)"', x)
-              return float(m.group(1)) if m else 0.0
-          out = sys.argv[3]
-          stage = os.environ.get("STAGE","")
-          data = {
-              "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-              "hostname": os.uname().nodename,
-              "instance_id": os.popen("curl -s http://169.254.169.254/latest/meta-data/instance-id").read().strip(),
-              "region": os.environ.get("REGION",""),
-              "bucket": os.environ.get("BUCKET",""),
-              "run_id": os.environ.get("RUN",""),
-              "stage": stage,
-              "lynis_hardening_index": idx(r(sys.argv[1])),
-              "openscap_score": score(r(sys.argv[2])),
-              "artifacts":{
-                  "lynis_log": f"/tmp/reports/{stage}/lynis.log",
-                  "lynis_report": f"/tmp/reports/{stage}/lynis-report.dat",
-                  "openscap_results": f"/tmp/reports/{stage}/openscap-results.xml",
-                  "openscap_html": f"/tmp/reports/{stage}/openscap-report.html"
-              }
-          }
-          open(out,"w").write(json.dumps(data))
-          print(json.dumps(data))
+          # tools
+          sudo dnf -y install awscli || sudo yum -y install awscli || true
+          sudo dnf -y install jq python3 openscap openscap-scanner scap-security-guide || sudo yum -y install jq python3 openscap openscap-scanner scap-security-guide || true
+          curl -sL https://downloads.cisofy.com/lynis/lynis-3.0.9.tar.gz | sudo tar xz -C /opt || true
+          sudo ln -sf /opt/lynis/lynis /usr/local/bin/lynis || true
+          mkdir -p /tmp/reports
+
+          # summarizer
+          cat > /tmp/summarize_json.py <<'PY'
+          import json, re, xml.etree.ElementTree as ET
+          li=None
+          for line in open('/tmp/reports/lynis-report.dat','r',errors='ignore'):
+              m=re.search(r'HARDENING_INDEX\\s*=\\s*(\\d+)',line)
+              if m: li=int(m.group(1)); break
+          osc=None
+          root=ET.parse('/tmp/reports/openscap-results.xml').getroot()
+          for s in root.iter():
+              if s.tag.endswith('score'):
+                  try:
+                      v=float((s.text or '').strip()); osc=v*100 if v<=1.0 else v; break
+                  except: pass
+          status = ('pass' if (osc and osc>=70) and (li and li>=60) else 'warn')
+          print(json.dumps({'lynis_hardening_index':li,'openscap_score':osc,'status':status}))
           PY
 
-          # --- remote orchestrator ---
-          cat > remote_demo.sh <<'BASH'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          export PATH="$HOME/.local/bin:$PATH"
-          BUCKET="${BUCKET}"; REGION="${REGION}"; RUN="${RUN}"
-          IID="$(curl -s http://169.254.169.254/latest/meta-data/instance-id || true)"
-          KEY_PREFIX="${KEY_PREFIX}"
-          sudo dnf -y install awscli lynis openscap openscap-scanner scap-security-guide jq python3 || \
-          sudo yum -y install  awscli lynis openscap openscap-scanner scap-security-guide jq python3 || true
-          aws s3 cp "s3://$BUCKET/$KEY_PREFIX/make_noncompliant.sh" /tmp/make_noncompliant.sh --region "$REGION"
-          aws s3 cp "s3://$BUCKET/$KEY_PREFIX/remediate_and_harden.sh" /tmp/remediate_and_harden.sh --region "$REGION"
-          aws s3 cp "s3://$BUCKET/$KEY_PREFIX/summarize_json.py" /tmp/summarize_json.py --region "$REGION"
-          chmod +x /tmp/make_noncompliant.sh /tmp/remediate_and_harden.sh
-          run_scan () {
-            local STAGE="$1"; local DIR="/tmp/reports/${STAGE}"; mkdir -p "$DIR"
-            lynis audit system --nocolors --quick --logfile "$DIR/lynis.log" --report-file "$DIR/lynis-report.dat" || true
-            DS=""
-            for p in /usr/share/xml/scap/ssg/ssg-al2023-ds.xml /usr/share/xml/scap/ssg/ssg-amazon_linux_2-ds.xml; do
-              [ -f "$p" ] && { DS="$p"; break; }
-            done
-            [ -z "$DS" ] && DS=$(find /usr/share/xml/scap/ssg -maxdepth 1 -type f -name 'ssg-*-ds.xml' -print -quit 2>/dev/null || true)
-            if [ -n "$DS" ]; then
-              PROF=$(oscap info "$DS" | awk '/^Profile/{print $2; exit}' || true)
-              oscap xccdf eval --fetch-remote-resources ${PROF:+--profile "$PROF"} \
-                --results "$DIR/openscap-results.xml" --report "$DIR/openscap-report.html" "$DS" || true
-            else
-              echo "No SSG content present; skipping OpenSCAP" > "$DIR/openscap-report.html"; : > "$DIR/openscap-results.xml"
-            fi
-            STAGE="$STAGE" REGION="$REGION" BUCKET="$BUCKET" RUN="$RUN" \
-              python3 /tmp/summarize_json.py "$DIR/lynis-report.dat" "$DIR/openscap-results.xml" "$DIR/summary.json" || true
-            aws s3 cp "$DIR/lynis.log"            "s3://$BUCKET/$RUN/demo/$STAGE/lynis.log"            --region "$REGION" || true
-            aws s3 cp "$DIR/lynis-report.dat"     "s3://$BUCKET/$RUN/demo/$STAGE/lynis-report.dat"     --region "$REGION" || true
-            aws s3 cp "$DIR/openscap-results.xml" "s3://$BUCKET/$RUN/demo/$STAGE/openscap-results.xml" --region "$REGION" || true
-            aws s3 cp "$DIR/openscap-report.html" "s3://$BUCKET/$RUN/demo/$STAGE/openscap-report.html" --region "$REGION" || true
-            aws s3 cp "$DIR/summary.json"         "s3://$BUCKET/$RUN/demo/$STAGE/summary.json"         --region "$REGION" || true
-            L=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("lynis_hardening_index",0))' "$DIR/summary.json" 2>/dev/null || echo 0)
-            O=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("openscap_score",0))' "$DIR/summary.json" 2>/dev/null || echo 0)
-            aws cloudwatch put-metric-data --region "$REGION" --namespace "ComplianceDemo" \
-              --metric-name "LynisHardeningIndex" --value "${L:-0}" --unit "Count" \
-              --dimensions "InstanceId=${IID},Run=${RUN},Stage=${STAGE}" || true
-            aws cloudwatch put-metric-data --region "$REGION" --namespace "ComplianceDemo" \
-              --metric-name "OpenSCAPScore" --value "${O:-0}" --unit "Percent" \
-              --dimensions "InstanceId=${IID},Run=${RUN},Stage=${STAGE}" || true
-            aws cloudwatch put-metric-data --region "$REGION" --namespace "ComplianceDemo" \
-              --metric-name "Status" --value 1 --unit "Count" \
-              --dimensions "InstanceId=${IID},Run=${RUN},Stage=${STAGE}" || true
-            echo "---SUMMARY-JSON-${STAGE^^}---"; cat "$DIR/summary.json" || true; echo "---END-SUMMARY-${STAGE^^}---"
+          make_noncompliant(){
+            log "making non-compliant"
+            sudo sed -i 's/^#\\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+            sudo systemctl restart sshd || true
+            sudo dnf -y remove fail2ban || sudo yum -y remove -y fail2ban || true
+            sudo systemctl disable --now dnf-automatic.timer || true
           }
-          echo "== BEFORE: make non-compliant =="; bash /tmp/make_noncompliant.sh || true; (systemctl restart sshd || true); run_scan "before"
-          echo "== AFTER: remediate & harden =="; bash /tmp/remediate_and_harden.sh || true; (systemctl restart sshd || true); run_scan "after"
-          aws s3 cp "s3://$BUCKET/$RUN/demo/after/openscap-report.html" "s3://$BUCKET/latest/openscap-report-after.html" --region "$REGION" || true
-          aws s3 sync "s3://$BUCKET/$RUN/" "s3://$BUCKET/latest/" --delete --region "$REGION" || true
+
+          remediate(){
+            log "remediating"
+            sudo sed -i 's/^#\\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config || true
+            sudo systemctl restart sshd || true
+            sudo dnf -y install fail2ban || sudo yum -y install -y fail2ban || true
+            sudo systemctl enable --now dnf-automatic.timer || true
+          }
+
+          scan(){
+            STAGE="$1"
+            log "scan $STAGE"
+            lynis audit system --quiet --report-file /tmp/reports/lynis-report.dat
+            oscap xccdf eval --profile xccdf_org.ssgproject.content_profile_standard \
+              --results /tmp/reports/openscap-results.xml \
+              --report  /tmp/reports/openscap-report.html \
+              /usr/share/xml/scap/ssg-amazon_linux_2023-xccdf.xml
+            python3 /tmp/summarize_json.py > /tmp/reports/summary.json
+
+            # publish
+            aws s3 cp /tmp/reports "s3://$BUCKET/$RUN/$STAGE/" --recursive --region "$REGION"
+
+            # metrics (Repo/Branch + Stage)
+            J=$(cat /tmp/reports/summary.json)
+            LYNIS=$(echo "$J" | jq -r '.lynis_hardening_index // 0')
+            OSC=$(echo "$J"  | jq -r '.openscap_score // 0')
+            STATUS=$(echo "$J" | jq -r '.status // "warn"')
+            VAL=$([ "$STATUS" = pass ] && echo 1 || echo 0)
+            aws cloudwatch put-metric-data --region "$REGION" --namespace "$NS" --metric-data "[
+              {\"MetricName\":\"OpenSCAPScore\",\"Value\":$OSC,\"Unit\":\"None\",\"Dimensions\":[{\"Name\":\"Repo\",\"Value\":\"$REPO\"},{\"Name\":\"Branch\",\"Value\":\"$BRANCH\"},{\"Name\":\"Stage\",\"Value\":\"$STAGE\"}]},
+              {\"MetricName\":\"LynisHardeningIndex\",\"Value\":$LYNIS,\"Unit\":\"None\",\"Dimensions\":[{\"Name\":\"Repo\",\"Value\":\"$REPO\"},{\"Name\":\"Branch\",\"Value\":\"$BRANCH\"},{\"Name\":\"Stage\",\"Value\":\"$STAGE\"}]},
+              {\"MetricName\":\"Status\",\"Value\":$VAL,\"Unit\":\"Count\",\"Dimensions\":[{\"Name\":\"Repo\",\"Value\":\"$REPO\"},{\"Name\":\"Branch\",\"Value\":\"$BRANCH\"},{\"Name\":\"Stage\",\"Value\":\"$STAGE\"}]}
+            ]"
+
+            # convenience copy of AFTER
+            if [ "$STAGE" = "After" ]; then
+              aws s3 cp /tmp/reports/openscap-report.html "s3://$BUCKET/latest/openscap-report-after.html" --region "$REGION" || true
+            fi
+          }
+
+          make_noncompliant
+          scan "Before"
+          remediate
+          scan "After"
           BASH
-          chmod +x remote_demo.sh
 
-          KEY_PREFIX="demo-scripts/${RUN}"
-          echo "key_prefix=$KEY_PREFIX" >> "$GITHUB_OUTPUT"
-          aws s3 cp make_noncompliant.sh     "s3://${BUCKET}/${KEY_PREFIX}/make_noncompliant.sh" --region "${REGION}"
-          aws s3 cp remediate_and_harden.sh  "s3://${BUCKET}/${KEY_PREFIX}/remediate_and_harden.sh" --region "${REGION}"
-          aws s3 cp summarize_json.py        "s3://${BUCKET}/${KEY_PREFIX}/summarize_json.py" --region "${REGION}"
-          aws s3 cp remote_demo.sh           "s3://${BUCKET}/${KEY_PREFIX}/remote_demo.sh" --region "${REGION}"
+          CMDS=$(printf "bash -lc 'cat > /tmp/demo.sh <<\"EOS\"\n%s\nEOS\nchmod +x /tmp/demo.sh'\n" "$(cat demo.sh)")
+          CID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$IID" \
+            --comment "upload demo.sh" \
+            --parameters "commands=$CMDS" \
+            --query "Command.CommandId" --output text)
+          echo "upload_cmd_id=$CID" >> "$GITHUB_OUTPUT"
 
-      - name: Run demo remotely via SSM
-        id: run
+      - name: Run the demo
+        id: runcmd
         shell: bash
         env:
           IID: ${{ steps.launch.outputs.iid }}
-          RUN: ${{ steps.stage.outputs.run }}
-          KEY_PREFIX: ${{ steps.stage.outputs.key_prefix }}
         run: |
           set -euo pipefail
-          echo "Target $IID"
-          read -r -d '' CMDS <<'EOS'
-          sudo dnf -y install awscli || sudo yum -y install awscli || true
-          aws s3 cp "s3://$BUCKET/$KEY_PREFIX/remote_demo.sh" /tmp/remote_demo.sh --region "$AWS_REGION"
-          sudo env BUCKET="$BUCKET" REGION="$AWS_REGION" RUN="$RUN" KEY_PREFIX="$KEY_PREFIX" bash /tmp/remote_demo.sh
-          EOS
-          CMD_ID=$(aws ssm send-command \
+          RUN_ID="${GITHUB_RUN_ID}-${GITHUB_SHA::7}"
+          CID=$(aws ssm send-command \
             --document-name "AWS-RunShellScript" \
             --instance-ids "$IID" \
-            --comment "Before/After demo $RUN" \
-            --parameters "commands=$CMDS" \
+            --comment "run demo $RUN_ID" \
+            --parameters commands="bash -lc '/tmp/demo.sh \"${AWS_REGION}\" \"${REPORTS_BUCKET}\" \"${REPO_NAME}\" \"${GITHUB_REF_NAME}\" \"${METRIC_NAMESPACE}\" \"$RUN_ID\"'" \
             --query "Command.CommandId" --output text)
-          echo "cmd_id=$CMD_ID" >> "$GITHUB_OUTPUT"
-          STATUS=""
-          for _ in $(seq 1 90); do
-            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --query Status --output text || true)
-            [[ "$STATUS" =~ ^(Success|Failed|Cancelled|TimedOut)$ ]] && break
+          echo "cmd_id=$CID" >> "$GITHUB_OUTPUT"
+
+          for i in {1..90}; do
+            S=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$IID" --query Status --output text || true)
+            [[ "$S" =~ ^(Success|Failed|Cancelled|TimedOut)$ ]] && break
             sleep 5
           done
-          echo "SSM status: $STATUS"
-          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --output json > demo-ssm-out.json
+          echo "SSM status: $S"
+          aws ssm get-command-invocation --command-id "$CID" --instance-id "$IID" --output json > demo-ssm-out.json
           jq -r '.StandardOutputContent' demo-ssm-out.json > demo-stdout.txt
           jq -r '.StandardErrorContent'  demo-ssm-out.json > demo-stderr.txt
-          test "$STATUS" = "Success" || { echo "::error::remote demo failed"; exit 1; }
-
-      - name: Download summaries from S3 (for artifact)
-        shell: bash
-        env:
-          RUN: ${{ steps.stage.outputs.run }}
-        run: |
-          set -euo pipefail
-          mkdir -p demo-artifacts
-          aws s3 cp "s3://$BUCKET/$RUN/demo/before/summary.json" demo-artifacts/summary-before.json || true
-          aws s3 cp "s3://$BUCKET/$RUN/demo/after/summary.json"  demo-artifacts/summary-after.json  || true
-          echo "Before summary:"; jq . demo-artifacts/summary-before.json || true
-          echo "After summary:";  jq . demo-artifacts/summary-after.json  || true
+          test "$S" = "Success" || { echo "::error::remote demo failed"; exit 1; }
 
       - name: Output handy links
-        shell: bash
-        env:
-          RUN: ${{ steps.stage.outputs.run }}
+        if: always()
         run: |
-          set -euo pipefail
-          echo "S3 paths:"
-          echo "  s3://$BUCKET/$RUN/demo/before/"
-          echo "  s3://$BUCKET/$RUN/demo/after/"
-          echo "  s3://$BUCKET/latest/"
-          echo
-          echo "If S3 website is enabled:"
-          echo "  http://$BUCKET.s3-website-${AWS_REGION}.amazonaws.com/$RUN/demo/after/openscap-report.html"
-          echo "  http://$BUCKET.s3-website-${AWS_REGION}.amazonaws.com/latest/openscap-report-after.html"
+          echo "S3 reports (latest After): http://auto-sec-reports-1757193665.s3-website-us-east-1.amazonaws.com/latest/openscap-report-after.html"
 
       - name: Upload runner artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: demo-${{ steps.stage.outputs.run }}
+          name: demo-ssm-logs
           path: |
             demo-ssm-out.json
             demo-stdout.txt
             demo-stderr.txt
-            demo-artifacts/summary-before.json
-            demo-artifacts/summary-after.json
-          if-no-files-found: warn
 
-      - name: Terminate EC2 (always)
+      - name: Terminate demo instance
         if: always()
         shell: bash
         env:
           IID: ${{ steps.launch.outputs.iid }}
-        run: |
-          set -euo pipefail
-          if [ -n "${IID:-}" ]; then
-            echo "Terminating $IID"
-            aws ec2 terminate-instances --instance-ids "$IID" >/dev/null 2>&1 || true
-            aws ec2 wait instance-terminated --instance-ids "$IID" || true
-            echo "Instance $IID terminated (or cleanup attempted)."
-          else
-            echo "No instance id to terminate."
-          fi
+        run: aws ec2 terminate-instances --instance-ids "$IID" && echo "terminated: $IID"
