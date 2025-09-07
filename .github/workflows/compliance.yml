@@ -1,3 +1,4 @@
+# .github/workflows/compliance.yml
 name: Compliance (main)
 
 on:
@@ -6,42 +7,48 @@ on:
   workflow_dispatch:
     inputs:
       instance_id:
-        description: "EC2 InstanceId (optional; falls back to first SSM Online Linux)"
+        description: "EC2 InstanceId (optional; falls back to first SSM Online Linux or repo var INSTANCE_ID)"
         required: false
-        default: ""
+        default: ""    # keeps input as a string
 
 permissions:
   id-token: write
   contents: read
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-  BUCKET:     ${{ vars.BUCKET }}
-  ROLE_ARN:   ${{ vars.AWS_ROLE_ARN }}
-  PHASE:      ci
+  AWS_REGION:          ${{ vars.AWS_REGION }}          # e.g. us-east-1
+  AWS_DEFAULT_REGION:  ${{ vars.AWS_REGION }}
+  BUCKET:              ${{ vars.BUCKET }}              # e.g. auto-sec-reports-123456789012
+  ROLE_ARN:            ${{ vars.AWS_ROLE_ARN }}        # arn:aws:iam::<acct>:role/GitHubOIDCRole
+  PHASE:               ci
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Ensure jq (runner)
-        run: sudo apt-get update && sudo apt-get install -y jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
 
       - name: Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region:     ${{ env.AWS_REGION }}
+          audience:       sts.amazonaws.com
+          output-env-credentials: true
 
       - name: Resolve target instance (SSM Online or provided)
         id: target
         shell: bash
         run: |
           set -euo pipefail
-          IID="${{ github.event.inputs.instance_id || '' }}"
-          if [ -z "$IID" ]; then IID="${{ vars.INSTANCE_ID || '' }}"; fi
+          IID="${{ inputs.instance_id }}"
+          if [ -z "$IID" ]; then IID="${{ vars.INSTANCE_ID }}"; fi
           if [ -z "$IID" ]; then
             IID=$(aws ssm describe-instance-information \
               --filters "Key=PingStatus,Values=Online" "Key=PlatformType,Values=Linux" \
@@ -57,9 +64,7 @@ jobs:
         id: stage
         shell: bash
         env:
-          BUCKET: ${{ env.BUCKET }}
           REGION: ${{ env.AWS_REGION }}
-          PHASE:  ${{ env.PHASE }}
         run: |
           set -euo pipefail
           RUN=$(date -u +%Y%m%dT%H%M%SZ)
@@ -75,12 +80,15 @@ jobs:
           PHASE="${PHASE}"
           RUN="${RUN}"
 
+          # Try DNF first, then Yum
           sudo dnf -y install lynis openscap openscap-scanner scap-security-guide jq python3 || \
           sudo yum -y install lynis openscap openscap-scanner scap-security-guide jq python3 || true
 
+          # Ansible (rpm first, else pip user)
           sudo dnf -y install ansible-core || sudo yum -y install ansible-core || \
             python3 -m pip install --user --upgrade ansible
 
+          # --- Ansible playbook: baseline + scans + artifact collection ---
           cat >/tmp/pb.yml <<'PYAML'
           - name: Baseline + Scan + Collect
             hosts: localhost
@@ -108,14 +116,14 @@ jobs:
                 package: { name: scap-security-guide, state: present }
                 ignore_errors: yes
 
-              - name: Lynis | run audit
+              - name: Lynis | run audit (quiet, to /tmp/reports)
                 command: >
                   lynis audit system --nocolors --quick
                   --logfile {{ reports_dir }}/lynis.log
                   --report-file {{ reports_dir }}/lynis-report.dat
                 changed_when: false
 
-              - name: OpenSCAP | locate SSG datastream
+              - name: OpenSCAP | locate SSG datastream (prefer AL2023/AL2; else first match)
                 shell: |
                   for p in /usr/share/xml/scap/ssg/ssg-al2023-ds.xml \
                            /usr/share/xml/scap/ssg/ssg-amazon_linux_2-ds.xml; do
@@ -126,14 +134,14 @@ jobs:
                 changed_when: false
                 failed_when: false
 
-              - name: OpenSCAP | pick first profile (if content found)
+              - name: OpenSCAP | pick first available profile (if content found)
                 shell: oscap info {{ ssg_ds.stdout }} | awk '/^Profile/{print $2; exit}'
                 register: prof
                 changed_when: false
                 failed_when: false
-                when: ssg_ds.stdout | length > 0
+                when: ssg_ds.stdout is defined and ssg_ds.stdout | length > 0
 
-              - name: OpenSCAP | eval -> results.xml + report.html
+              - name: OpenSCAP | eval -> results.xml + report.html (if content found)
                 command: >
                   oscap xccdf eval --fetch-remote-resources
                   --results {{ reports_dir }}/openscap-results.xml
@@ -141,12 +149,12 @@ jobs:
                   {% if prof.stdout %} --profile {{ prof.stdout }} {% endif %}
                   {{ ssg_ds.stdout }}
                 changed_when: false
-                when: ssg_ds.stdout | length > 0
+                when: ssg_ds.stdout is defined and ssg_ds.stdout | length > 0
 
-              - name: OpenSCAP | warn when no content
+              - name: OpenSCAP | warn when no content found (skip)
                 debug:
                   msg: "No SSG datastream found; skipping OpenSCAP on this AMI."
-                when: ssg_ds.stdout | length == 0
+                when: ssg_ds.stdout is not defined or ssg_ds.stdout | length == 0
 
             handlers:
               - name: restart sshd
@@ -155,46 +163,59 @@ jobs:
 
           ansible-playbook -i "localhost," -c local --become /tmp/pb.yml
 
+          # Summarize into JSON
           cat >/tmp/summarize_json.py <<'PY'
           import json, os, re, sys
           from datetime import datetime, timezone
+
           def r(p):
-            try: return open(p,encoding="utf-8",errors="ignore").read()
-            except: return ""
+              try:
+                  return open(p, encoding="utf-8", errors="ignore").read()
+              except:
+                  return ""
+
           def idx(t):
-            m=re.search(r'hardening[_ ]index[^0-9]*([0-9]{1,3})',t,re.I); return int(m.group(1)) if m else 0
+              import re
+              m = re.search(r'hardening[_ ]index[^0-9]*([0-9]{1,3})', t, re.I)
+              return int(m.group(1)) if m else 0
+
           def score(x):
-            m=re.search(r'score="([0-9]+(?:\.[0-9]+)?)"',x); return float(m.group(1)) if m else 0.0
-          out=sys.argv[3]
-          data={
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "hostname": os.uname().nodename,
-            "instance_id": os.popen("curl -s http://169.254.169.254/latest/meta-data/instance-id").read().strip(),
-            "region": os.environ.get("REGION",""),
-            "bucket": os.environ.get("BUCKET",""),
-            "run_id": os.environ.get("RUN",""),
-            "lynis_hardening_index": idx(r(sys.argv[1])),
-            "openscap_score": score(r(sys.argv[2])),
-            "artifacts":{
-              "lynis_log": "/tmp/reports/lynis.log",
-              "lynis_report": "/tmp/reports/lynis-report.dat",
-              "openscap_results": "/tmp/reports/openscap-results.xml",
-              "openscap_html": "/tmp/reports/openscap-report.html"
-            }
+              import re
+              m = re.search(r'score="([0-9]+(?:\.[0-9]+)?)"', x)
+              return float(m.group(1)) if m else 0.0
+
+          out = sys.argv[3]
+          data = {
+              "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+              "hostname": os.uname().nodename,
+              "instance_id": os.popen("curl -s http://169.254.169.254/latest/meta-data/instance-id").read().strip(),
+              "region": os.environ.get("REGION",""),
+              "bucket": os.environ.get("BUCKET",""),
+              "run_id": os.environ.get("RUN",""),
+              "lynis_hardening_index": idx(r(sys.argv[1])),
+              "openscap_score": score(r(sys.argv[2])),
+              "artifacts":{
+                  "lynis_log": "/tmp/reports/lynis.log",
+                  "lynis_report": "/tmp/reports/lynis-report.dat",
+                  "openscap_results": "/tmp/reports/openscap-results.xml",
+                  "openscap_html": "/tmp/reports/openscap-report.html"
+              }
           }
           open(out,"w").write(json.dumps(data))
           print(json.dumps(data))
           PY
 
-          python3 /tmp/summarize_json.py /tmp/reports/lynis-report.dat /tmp/reports/openscap-results.xml /tmp/reports/summary.json >/tmp/summary.stdout
+          python3 /tmp/summarize_json.py /tmp/reports/lynis-report.dat /tmp/reports/openscap-results.xml /tmp/reports/summary.json >/tmp/summary.stdout || true
 
+          # Publish artifacts to S3 (best-effort)
           for f in lynis-report.dat lynis.log openscap-report.html openscap-results.xml summary.json; do
-            [ -f "/tmp/reports/$f" ] && aws s3 cp "/tmp/reports/$f" "s3://$BUCKET/$RUN/${PHASE}/$f" --region "$REGION" || true
+            [ -f "/tmp/reports/$f" ] && \
+              aws s3 cp "/tmp/reports/$f" "s3://$BUCKET/$RUN/${PHASE}/$f" --region "$REGION" || true
           done
           aws s3 sync "s3://$BUCKET/$RUN/" "s3://$BUCKET/latest/" --delete --region "$REGION" || true
 
           echo '---SUMMARY-JSON---'
-          cat /tmp/reports/summary.json || cat /tmp/summary.stdout || true
+          cat /tmp/reports/summary.json 2>/dev/null || cat /tmp/summary.stdout 2>/dev/null || true
           echo '---END-SUMMARY---'
           EOS
           chmod +x remote.sh
@@ -207,53 +228,106 @@ jobs:
         id: ssm
         shell: bash
         env:
+          REGION: ${{ env.AWS_REGION }}
           RUN:    ${{ steps.stage.outputs.run }}
           KEY:    ${{ steps.stage.outputs.key }}
-          BUCKET: ${{ env.BUCKET }}
-          REGION: ${{ env.AWS_REGION }}
         run: |
           set -euo pipefail
           IID="${{ steps.target.outputs.iid }}"
+
           CMD_ID=$(aws ssm send-command \
             --document-name "AWS-RunShellScript" \
             --instance-ids "$IID" \
             --comment "Compliance scan $RUN" \
-            --parameters commands="aws s3 cp s3://$BUCKET/$KEY /tmp/remote.sh --region $REGION && sudo bash /tmp/remote.sh" \
+            --parameters commands="aws s3 cp s3://$BUCKET/$KEY /tmp/remote.sh --region $REGION && sudo env BUCKET=$BUCKET REGION=$REGION PHASE=$PHASE RUN=$RUN bash /tmp/remote.sh" \
             --query "Command.CommandId" --output text)
           echo "cmd_id=$CMD_ID" >> "$GITHUB_OUTPUT"
 
+          STATUS=""
           for _ in $(seq 1 60); do
             STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --query Status --output text || true)
             [[ "$STATUS" =~ ^(Success|Failed|Cancelled|TimedOut)$ ]] && break
             sleep 5
           done
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::SSM command ended with status: $STATUS"
+            aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --output json | jq -r '.StandardErrorContent' | tail -n 200 || true
+            exit 1
+          fi
+
+          # Capture stdout and extract the embedded summary JSON
           aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --output json > out.json
           jq -r '.StandardOutputContent' out.json > stdout.txt
           awk '/---SUMMARY-JSON---/{flag=1;next}/---END-SUMMARY---/{flag=0}flag' stdout.txt > summary.json
-          jq . summary.json || { echo "summary.json missing"; tail -n 200 stdout.txt || true; }
+
+          # If summary is missing or invalid, synthesize minimal summary for downstream steps
+          jq . summary.json >/dev/null 2>&1 || {
+            echo "::warning::summary.json missing or invalid; keeping metrics at 0"
+            echo '{"lynis_hardening_index":0,"openscap_score":0}' > summary.json
+          }
+
+          echo "Summary preview:"
+          jq -c . summary.json || true
 
       - name: Emit CloudWatch metrics
-        if: ${{ hashFiles('summary.json') != '' }}
+        # If metrics push fails (e.g., IAM), warn but don't fail the whole job
+        continue-on-error: true
+        shell: bash
+        env:
+          RUN: ${{ steps.stage.outputs.run }}
+          IID: ${{ steps.target.outputs.iid }}
+        run: |
+          set -euo pipefail
+          # Safely coerce to numbers (0 when absent/invalid)
+          LYNIS=$(jq -r 'try (.lynis_hardening_index|tonumber) catch 0' summary.json 2>/dev/null || echo 0)
+          OSCAP=$(jq -r 'try (.openscap_score|tonumber)     catch 0' summary.json 2>/dev/null || echo 0)
+
+          # Defensive numeric validation
+          case "$LYNIS" in ''|*[!0-9.]* ) LYNIS=0 ;; esac
+          case "$OSCAP" in ''|*[!0-9.]* ) OSCAP=0 ;; esac
+
+          echo "LYNIS=$LYNIS OSCAP=$OSCAP IID=$IID RUN=$RUN"
+
+          # Build valid JSON with jq -n and send via file://
+          jq -n \
+            --arg iid "$IID" \
+            --arg run "$RUN" \
+            --argjson lynis ${LYNIS:-0} \
+            --argjson oscap ${OSCAP:-0} \
+            '[{"MetricName":"LynisHardeningIndex","Value":$lynis,"Unit":"Count",
+               "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":$run}]},
+              {"MetricName":"OpenSCAPScore","Value":$oscap,"Unit":"Percent",
+               "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":$run}]},
+              {"MetricName":"Status","Value":1,"Unit":"Count",
+               "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":$run}]}]' > metrics.json
+
+          echo "Metric payload:"
+          jq . metrics.json || true
+
+          aws cloudwatch put-metric-data --namespace "ComplianceMetrics" --metric-data file://metrics.json
+
+      - name: Upload diagnostics (artifact)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-${{ steps.stage.outputs.run }}
+          path: |
+            summary.json
+            metrics.json
+            out.json
+            stdout.txt
+
+      - name: Output links
+        if: ${{ always() }}
         shell: bash
         run: |
           set -euo pipefail
-          RUN="${{ steps.stage.outputs.run }}"
-          IID="${{ steps.target.outputs.iid }}"
-          LYNIS=$(jq -r '.lynis_hardening_index // 0' summary.json)
-          OSCAP=$(jq -r '.openscap_score // 0' summary.json)
-          STATUS=1
-          aws cloudwatch put-metric-data --namespace "ComplianceMetrics" --metric-data "[
-            {\"MetricName\":\"LynisHardeningIndex\",\"Value\":$LYNIS,\"Unit\":\"Count\",
-             \"Dimensions\":[{\"Name\":\"InstanceId\",\"Value\":\"$IID\"},{\"Name\":\"Run\",\"Value\":\"$RUN\"}]},
-            {\"MetricName\":\"OpenSCAPScore\",\"Value\":$OSCAP,\"Unit\":\"Percent\",
-             \"Dimensions\":[{\"Name\":\"InstanceId\",\"Value\":\"$IID\"},{\"Name\":\"Run\",\"Value\":\"$RUN\"}]},
-            {\"MetricName\":\"Status\",\"Value\":$STATUS,\"Unit\":\"Count\",
-             \"Dimensions\":[{\"Name\":\"InstanceId\",\"Value\":\"$IID\"},{\"Name\":\"Run\",\"Value\":\"$RUN\"}]}
-          ]"
+          echo "Artifacts (S3 paths):"
+          echo "  s3://$BUCKET/${{ steps.stage.outputs.run }}/"
+          echo "  s3://$BUCKET/latest/"
+          echo
+          echo "If the bucket is fronted by S3 static website hosting, try:"
+          echo "  http://$BUCKET.s3-website-${AWS_REGION}.amazonaws.com/${{ steps.stage.outputs.run }}/"
+          echo "  http://$BUCKET.s3-website-${AWS_REGION}.amazonaws.com/latest/"
 
-      - name: Output links
-        shell: bash
-        run: |
-          RUN="${{ steps.stage.outputs.run }}"
-          echo "Run URL:    http://${{ env.BUCKET }}.s3-website-${{ env.AWS_REGION }}.amazonaws.com/$RUN/"
-          echo "Latest URL: http://${{ env.BUCKET }}.s3-website-${{ env.AWS_REGION }}.amazonaws.com/latest/"
