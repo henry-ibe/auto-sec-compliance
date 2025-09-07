@@ -4,6 +4,7 @@ on:
 permissions:
   id-token: write
   contents: read
+
 env:
   AWS_REGION: us-east-1
   REPORTS_BUCKET: auto-sec-reports-1757193665
@@ -46,7 +47,6 @@ jobs:
           VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query "Vpcs[0].VpcId" --output text)
           [ "$VPC" != "None" ] || { echo "::error::No default VPC"; exit 1; }
 
-          # Try a public subnet first, else default-for-az (we also force associate-public-ip)
           SUBNET=$(aws ec2 describe-subnets \
             --filters Name=vpc-id,Values="$VPC" Name=map-public-ip-on-launch,Values=true \
             --query "Subnets[0].SubnetId" --output text)
@@ -78,7 +78,7 @@ jobs:
           PUBIP=$(aws ec2 describe-instances --instance-ids "$IID" --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
           echo "Public IP: $PUBIP"
           if [ "$PUBIP" = "None" ] || [ -z "$PUBIP" ]; then
-            echo "::error::Instance has no public IP (check IGW/route or use VPC endpoints for SSM)."; exit 1;
+            echo "::error::Instance has no public IP (check IGW route or use VPC endpoints for SSM)."; exit 1;
           fi
 
       - name: Wait for SSM Online
@@ -114,14 +114,12 @@ jobs:
 
           log(){ echo "[$(date -u +%FT%TZ)] $*"; }
 
-          # tools
           sudo dnf -y install awscli || sudo yum -y install awscli || true
           sudo dnf -y install jq python3 openscap openscap-scanner scap-security-guide || sudo yum -y install jq python3 openscap openscap-scanner scap-security-guide || true
           curl -sL https://downloads.cisofy.com/lynis/lynis-3.0.9.tar.gz | sudo tar xz -C /opt || true
           sudo ln -sf /opt/lynis/lynis /usr/local/bin/lynis || true
           mkdir -p /tmp/reports
 
-          # summarizer
           cat > /tmp/summarize_json.py <<'PY'
           import json, re, xml.etree.ElementTree as ET
           li=None
@@ -135,7 +133,7 @@ jobs:
                   try:
                       v=float((s.text or '').strip()); osc=v*100 if v<=1.0 else v; break
                   except: pass
-          status = ('pass' if (osc and osc>=70) and (li and li>=60) else 'warn')
+          status=('pass' if (osc and osc>=70) and (li and li>=60) else 'warn')
           print(json.dumps({'lynis_hardening_index':li,'openscap_score':osc,'status':status}))
           PY
 
@@ -146,7 +144,6 @@ jobs:
             sudo dnf -y remove fail2ban || sudo yum -y remove -y fail2ban || true
             sudo systemctl disable --now dnf-automatic.timer || true
           }
-
           remediate(){
             log "remediating"
             sudo sed -i 's/^#\\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config || true
@@ -154,21 +151,15 @@ jobs:
             sudo dnf -y install fail2ban || sudo yum -y install -y fail2ban || true
             sudo systemctl enable --now dnf-automatic.timer || true
           }
-
           scan(){
-            STAGE="$1"
-            log "scan $STAGE"
+            STAGE="$1"; log "scan $STAGE"
             lynis audit system --quiet --report-file /tmp/reports/lynis-report.dat
             oscap xccdf eval --profile xccdf_org.ssgproject.content_profile_standard \
               --results /tmp/reports/openscap-results.xml \
               --report  /tmp/reports/openscap-report.html \
               /usr/share/xml/scap/ssg-amazon_linux_2023-xccdf.xml
             python3 /tmp/summarize_json.py > /tmp/reports/summary.json
-
-            # publish
             aws s3 cp /tmp/reports "s3://$BUCKET/$RUN/$STAGE/" --recursive --region "$REGION"
-
-            # metrics (Repo/Branch + Stage)
             J=$(cat /tmp/reports/summary.json)
             LYNIS=$(echo "$J" | jq -r '.lynis_hardening_index // 0')
             OSC=$(echo "$J"  | jq -r '.openscap_score // 0')
@@ -179,13 +170,10 @@ jobs:
               {\"MetricName\":\"LynisHardeningIndex\",\"Value\":$LYNIS,\"Unit\":\"None\",\"Dimensions\":[{\"Name\":\"Repo\",\"Value\":\"$REPO\"},{\"Name\":\"Branch\",\"Value\":\"$BRANCH\"},{\"Name\":\"Stage\",\"Value\":\"$STAGE\"}]},
               {\"MetricName\":\"Status\",\"Value\":$VAL,\"Unit\":\"Count\",\"Dimensions\":[{\"Name\":\"Repo\",\"Value\":\"$REPO\"},{\"Name\":\"Branch\",\"Value\":\"$BRANCH\"},{\"Name\":\"Stage\",\"Value\":\"$STAGE\"}]}
             ]"
-
-            # convenience copy of AFTER
             if [ "$STAGE" = "After" ]; then
               aws s3 cp /tmp/reports/openscap-report.html "s3://$BUCKET/latest/openscap-report-after.html" --region "$REGION" || true
             fi
           }
-
           make_noncompliant
           scan "Before"
           remediate
@@ -216,7 +204,6 @@ jobs:
             --parameters commands="bash -lc '/tmp/demo.sh \"${AWS_REGION}\" \"${REPORTS_BUCKET}\" \"${REPO_NAME}\" \"${GITHUB_REF_NAME}\" \"${METRIC_NAMESPACE}\" \"$RUN_ID\"'" \
             --query "Command.CommandId" --output text)
           echo "cmd_id=$CID" >> "$GITHUB_OUTPUT"
-
           for i in {1..90}; do
             S=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$IID" --query Status --output text || true)
             [[ "$S" =~ ^(Success|Failed|Cancelled|TimedOut)$ ]] && break
@@ -231,7 +218,7 @@ jobs:
       - name: Output handy links
         if: always()
         run: |
-          echo "S3 reports (latest After): http://auto-sec-reports-1757193665.s3-website-us-east-1.amazonaws.com/latest/openscap-report-after.html"
+          echo "S3 (latest After): http://auto-sec-reports-1757193665.s3-website-us-east-1.amazonaws.com/latest/openscap-report-after.html"
 
       - name: Upload runner artifacts
         if: always()
