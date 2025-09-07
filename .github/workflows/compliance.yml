@@ -14,8 +14,280 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-  BUCKET:     ${{ vars.BUCKET }}
-  ROLE_ARN:   ${{ vars.AWS_ROLE_ARN }}
+  AWS_REGION: ${{ vars.AWS_REGION }}   # e.g. us-east-1
+  BUCKET:     ${{ vars.BUCKET }}       # e.g. auto-sec-reports-1757193665
+  ROLE_ARN:   ${{ vars.AWS_ROLE_ARN }} # arn:aws:iam::<acct>:role/GitHubOIDCRole
   PHASE:      ci
-# (… keep the rest of your existing jobs: section exactly as-is …)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure jq (runner)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Resolve target instance (SSM Online or provided)
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          IID="${{ github.event.inputs.instance_id || '' }}"
+          if [ -z "$IID" ]; then IID="${{ vars.INSTANCE_ID || '' }}"; fi
+          if [ -z "$IID" ]; then
+            IID=$(aws ssm describe-instance-information \
+              --filters "Key=PingStatus,Values=Online" "Key=PlatformType,Values=Linux" \
+              --query 'InstanceInformationList[0].InstanceId' --output text || true)
+          fi
+          if [ -z "$IID" ] || [ "$IID" = "None" ]; then
+            echo "No SSM Online instance found. Set repo var INSTANCE_ID or provide input." >&2
+            exit 1
+          fi
+          echo "iid=$IID" >> "$GITHUB_OUTPUT"
+
+      - name: Send SSM command (scan → summarize → publish)
+        id: ssm
+        shell: bash
+        run: |
+          set -euo pipefail
+          IID="${{ steps.target.outputs.iid }}"
+          RUN=$(date -u +%Y%m%dT%H%M%SZ)
+
+          # --- Playbook (same one you ran manually)
+          PB_CONTENT=$(cat <<'PYAML'
+- name: Baseline + Scan + Collect
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: true
+  vars:
+    reports_dir: /tmp/reports
+  tasks:
+    - name: Ensure reports dir exists
+      file: { path: "{{ reports_dir }}", state: directory, mode: '0755' }
+
+    - name: Minimal hardening | disable root SSH login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*PermitRootLogin\s+.*'
+        line: 'PermitRootLogin no'
+        backup: yes
+      notify: restart sshd
+
+    - name: Minimal hardening | ensure fail2ban (if available)
+      package: { name: fail2ban, state: present }
+      ignore_errors: yes
+
+    - name: Ensure OpenSCAP content present (best effort)
+      package: { name: scap-security-guide, state: present }
+      ignore_errors: yes
+
+    - name: Lynis | run audit
+      command: >
+        lynis audit system --nocolors --quick
+        --logfile {{ reports_dir }}/lynis.log
+        --report-file {{ reports_dir }}/lynis-report.dat
+      changed_when: false
+
+    - name: OpenSCAP | locate SSG datastream (prefer AL2023/AL2; search both roots)
+      shell: |
+        for p in \
+          /usr/share/xml/scap/ssg/ssg-al2023-ds.xml \
+          /usr/share/xml/scap/ssg/ssg-amazon_linux_2-ds.xml \
+          /usr/share/xml/scap/ssg/content/ssg-al2023-ds.xml \
+          /usr/share/xml/scap/ssg/content/ssg-amazon_linux_2-ds.xml; do
+          [ -f "$p" ] && { echo "$p"; exit 0; }
+        done
+        for root in /usr/share/xml/scap/ssg /usr/share/xml/scap/ssg/content; do
+          find "$root" -maxdepth 1 -type f -name 'ssg-*-ds.xml' -print -quit && exit 0
+        done
+      register: ssg_ds
+      changed_when: false
+      failed_when: false
+
+    - name: OpenSCAP | pick first available profile (if content found)
+      shell: oscap info {{ ssg_ds.stdout }} | awk '/^Profile/{print $2; exit}'
+      register: prof
+      changed_when: false
+      failed_when: false
+      when: ssg_ds.stdout is defined and ssg_ds.stdout | length > 0
+
+    - name: OpenSCAP | eval -> results.xml + report.html (if content found)
+      command: >
+        oscap xccdf eval --fetch-remote-resources
+        --results {{ reports_dir }}/openscap-results.xml
+        --report  {{ reports_dir }}/openscap-report.html
+        {% if prof.stdout %} --profile {{ prof.stdout }} {% endif %}
+        {{ ssg_ds.stdout }}
+      changed_when: false
+      when: ssg_ds.stdout is defined and ssg_ds.stdout | length > 0
+
+    - name: OpenSCAP | warn when no content found (skip)
+      debug: { msg: "No SSG datastream found; skipping OpenSCAP on this AMI." }
+      when: ssg_ds.stdout is not defined or ssg_ds.stdout | length == 0
+
+  handlers:
+    - name: restart sshd
+      service: { name: sshd, state: restarted }
+PYAML
+)
+          PB64=$(printf "%s" "$PB_CONTENT" | base64 -w0)
+
+          # --- summarize_json.py
+          SUM_CONTENT=$(cat <<'PY'
+#!/usr/bin/env python3
+import os, re, sys, json, socket, datetime
+from xml.etree import ElementTree as ET
+from urllib.request import Request, urlopen
+if len(sys.argv) != 4:
+  print("Usage: summarize_json.py <lynis-report.dat> <openscap-results.xml> <out.json>", file=sys.stderr); exit(2)
+lynis_path, oscap_path, out_path = sys.argv[1:]
+def imds(path):
+  try:
+    t=Request("http://169.254.169.254/latest/api/token",method="PUT",headers={"X-aws-ec2-metadata-token-ttl-seconds":"21600"})
+    token=urlopen(t,timeout=2).read().decode()
+    r=Request(f"http://169.254.169.254/latest/meta-data/{path}",headers={"X-aws-ec2-metadata-token":token})
+    return urlopen(r,timeout=2).read().decode()
+  except Exception: return None
+hard=None
+try:
+  with open(lynis_path,"r",errors="ignore") as f: text=f.read()
+  m=re.search(r'(?:hardening_index|HARDENING_INDEX)\s*=\s*([0-9]+)',text)
+  if m: hard=int(m.group(1))
+except Exception: pass
+score=None
+try:
+  root=ET.parse(oscap_path).getroot()
+  for s in root.iter():
+    if s.tag.endswith('score'):
+      try: score=float(s.text); break
+      except Exception: pass
+except Exception: pass
+out={"timestamp_utc":datetime.datetime.utcnow().isoformat()+"Z",
+     "hostname":socket.gethostname(),
+     "instance_id":imds("instance-id"),
+     "region":imds("placement/region") or imds("placement/availability-zone"),
+     "bucket":os.environ.get("BUCKET"),
+     "run_id":os.environ.get("RUN"),
+     "lynis_hardening_index":hard,
+     "openscap_score":score,
+     "artifacts":{"lynis_log":"/tmp/reports/lynis.log",
+                 "lynis_report":"/tmp/reports/lynis-report.dat",
+                 "openscap_results":"/tmp/reports/openscap-results.xml",
+                 "openscap_html":"/tmp/reports/openscap-report.html"}}
+with open(out_path,"w") as f: json.dump(out,f,indent=2)
+print(json.dumps(out,indent=2))
+PY
+)
+          SUM64=$(printf "%s" "$SUM_CONTENT" | base64 -w0)
+
+          # --- publish_to_s3.sh
+          PUB_CONTENT=$(cat <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${BUCKET:?missing}"; : "${RUN:?missing}"
+RUN="${RUN:-$(date -u +%Y%m%dT%H%M%SZ)}"
+aws s3 sync /tmp/reports "s3://$BUCKET/$RUN/" --only-show-errors
+aws s3 sync "s3://$BUCKET/$RUN/" "s3://$BUCKET/latest/" --delete --only-show-errors
+echo "Run URL:    http://$BUCKET.s3-website-${REGION:-us-east-1}.amazonaws.com/$RUN/"
+echo "Latest URL: http://$BUCKET.s3-website-${REGION:-us-east-1}.amazonaws.com/latest/"
+BASH
+)
+          PUB64=$(printf "%s" "$PUB_CONTENT" | base64 -w0)
+
+          # --- Commands executed on the instance via SSM
+          read -r -d '' CMDS <<EOF || true
+set -euo pipefail
+export PATH="\$HOME/.local/bin:\$PATH"
+mkdir -p /tmp/reports \$HOME/scripts
+
+# Ensure Ansible present for the user
+if ! command -v ansible-playbook >/dev/null 2>&1; then pip3 install --user ansible; fi
+
+# Drop files
+echo "$PB64"  | base64 -d > /tmp/playbook.yml
+echo "$SUM64" | base64 -d > /tmp/summarize_json.py; chmod +x /tmp/summarize_json.py
+echo "$PUB64" | base64 -d > \$HOME/scripts/publish_to_s3.sh; chmod +x \$HOME/scripts/publish_to_s3.sh
+
+# Run playbook locally
+sudo ansible-playbook -i "localhost," -c local --become /tmp/playbook.yml
+
+# Build summary.json
+export BUCKET="${{ env.BUCKET }}"; export REGION="${{ env.AWS_REGION }}"; export RUN="$RUN"; export PHASE="${{ env.PHASE }}"
+python3 /tmp/summarize_json.py /tmp/reports/lynis-report.dat /tmp/reports/openscap-results.xml /tmp/reports/summary.json
+chmod -R a+r /tmp/reports
+
+# Publish
+\$HOME/scripts/publish_to_s3.sh
+
+# Return summary JSON in stdout
+echo '---SUMMARY-JSON---'
+cat /tmp/reports/summary.json
+echo '---END-SUMMARY---'
+EOF
+
+          PARAMS=$(jq -cn --arg cmds "$CMDS" '{commands: ($cmds|split("\n"))}')
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$IID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Compliance scan $RUN" \
+            --parameters "$PARAMS" \
+            --query 'Command.CommandId' --output text)
+
+          echo "cmd=$CMD_ID" >> "$GITHUB_OUTPUT"
+          echo "run=$RUN"     >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSM and fetch summary
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+          IID="${{ steps.target.outputs.iid }}"
+          CMD="${{ steps.ssm.outputs.cmd }}"
+          for i in $(seq 1 60); do
+            OUT=$(aws ssm get-command-invocation --command-id "$CMD" --instance-id "$IID" || true)
+            STATUS=$(jq -r '.Status' <<<"$OUT")
+            if [ "$STATUS" = "Success" ]; then
+              echo "$OUT" > out.json; break
+            elif [ "$STATUS" = "Failed" ]; then
+              echo "$OUT" >&2; exit 1
+            fi
+            sleep 10
+          done
+          jq -r '.StandardOutputContent' out.json > stdout.txt
+          awk '/---SUMMARY-JSON---/{flag=1;next}/---END-SUMMARY---/{flag=0}flag' stdout.txt > summary.json
+          jq . summary.json
+          echo "summary=$(jq -c . summary.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Emit CloudWatch metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN="${{ steps.ssm.outputs.run }}"
+          IID="${{ steps.target.outputs.iid }}"
+          LYNIS=$(jq -r '.lynis_hardening_index // 0' summary.json)
+          OSCAP=$(jq -r '.openscap_score // 0' summary.json)
+          STATUS=1
+          aws cloudwatch put-metric-data --namespace "ComplianceMetrics" --metric-data "[
+            {\"MetricName\":\"LynisHardeningIndex\",\"Value\":$LYNIS,\"Unit\":\"Count\",
+             \"Dimensions\":[{\"Name\":\"InstanceId\",\"Value\":\"$IID\"},{\"Name\":\"Run\",\"Value\":\"$RUN\"}]},
+            {\"MetricName\":\"OpenSCAPScore\",\"Value\":$OSCAP,\"Unit\":\"Percent\",
+             \"Dimensions\":[{\"Name\":\"InstanceId\",\"Value\":\"$IID\"},{\"Name\":\"Run\",\"Value\":\"$RUN\"}]},
+            {\"MetricName\":\"Status\",\"Value\":$STATUS,\"Unit\":\"Count\",
+             \"Dimensions\":[{\"Name\":\"InstanceId\",\"Value\":\"$IID\"},{\"Name\":\"Run\",\"Value\":\"$RUN\"}]}
+          ]"
+
+      - name: Output links
+        shell: bash
+        run: |
+          RUN="${{ steps.ssm.outputs.run }}"
+          echo "Run URL:    http://${{ env.BUCKET }}.s3-website-${{ env.AWS_REGION }}.amazonaws.com/$RUN/"
+          echo "Latest URL: http://${{ env.BUCKET }}.s3-website-${{ env.AWS_REGION }}.amazonaws.com/latest/"
