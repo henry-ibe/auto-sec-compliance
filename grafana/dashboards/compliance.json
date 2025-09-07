@@ -1,0 +1,74 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_CLOUDWATCH",
+      "label": "CloudWatch",
+      "type": "datasource",
+      "pluginId": "cloudwatch",
+      "pluginName": "CloudWatch"
+    }
+  ],
+  "schemaVersion": 39,
+  "title": "Compliance Overview",
+  "tags": ["compliance","openscap","lynis"],
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      { "name": "repo",   "type": "textbox", "current": {"text":"<yourUser>/<yourRepo>", "value":"<yourUser>/<yourRepo>"} },
+      { "name": "branch", "type": "textbox", "current": {"text":"main", "value":"main"} },
+      { "name": "stage",  "type": "custom",  "query": "Before,After", "current": {"text":"After","value":"After"} }
+    ]
+  },
+  "annotations": { "list": [ { "builtIn": 1, "type": "dashboard", "name": "Annotations & Alerts", "hide": true } ] },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Latest Status (Pass=1, Warn=0)",
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 0},
+      "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "ComplianceMetrics",
+          "metricName": "Status",
+          "dimensions": { "Repo": "${repo}", "Branch": "${branch}", "Stage": "${stage}" },
+          "region": "us-east-1",
+          "stat": "Maximum"
+        }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "timeseries",
+      "title": "OpenSCAP Score",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+      "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "ComplianceMetrics",
+          "metricName": "OpenSCAPScore",
+          "dimensions": { "Repo": "${repo}", "Branch": "${branch}", "Stage": "${stage}" },
+          "region": "us-east-1",
+          "stat": "Average"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Lynis Hardening Index",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+      "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "ComplianceMetrics",
+          "metricName": "LynisHardeningIndex",
+          "dimensions": { "Repo": "${repo}", "Branch": "${branch}", "Stage": "${stage}" },
+          "region": "us-east-1",
+          "stat": "Average"
+        }
+      ]
+    }
+  ]
+}
