@@ -4,34 +4,29 @@ on:
   workflow_dispatch:
     inputs:
       instance_id:
-        description: "EC2 InstanceId to scan (blank = first SSM Online Linux)"
+        description: "EC2 InstanceId (optional; defaults to first SSM Online Linux)"
         required: false
-        default: ""
       bucket:
-        description: "S3 bucket for artifacts"
-        required: false
-        default: ""
+        description: "S3 bucket to store reports (required)"
+        required: true
       region:
-        description: "AWS Region"
-        required: false
+        description: "AWS region"
+        required: true
         default: "us-east-1"
-
-permissions:
-  contents: read
-  id-token: write
-
-env:
-  AWS_REGION: ${{ github.event.inputs.region || vars.AWS_REGION || 'us-east-1' }}
-  AWS_DEFAULT_REGION: ${{ github.event.inputs.region || vars.AWS_REGION || 'us-east-1' }}
-  BUCKET: ${{ github.event.inputs.bucket || vars.BUCKET }}
-  ROLE_ARN: ${{ vars.ROLE_ARN }}
-  NAMESPACE: ComplianceMetrics
-  # S3 prefix where reports go (keep as 'demo' to match your dashboard)
-  PHASE: demo
+      publish_dashboard:
+        description: "Update CloudWatch dashboard after publishing metrics"
+        type: boolean
+        default: true
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      AWS_REGION: ${{ inputs.region }}
+      AWS_DEFAULT_REGION: ${{ inputs.region }}
+      BUCKET: ${{ inputs.bucket }}
+      PHASE: demo
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,36 +39,36 @@ jobs:
       - name: Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.ROLE_ARN }}   # set repo variable ROLE_ARN to your role ARN
+          aws-region: ${{ inputs.region }}
           audience: sts.amazonaws.com
-          output-env-variables: true
+          output-env-credentials: true
 
       - name: Resolve target instance (SSM Online or provided)
         id: resolve
-        shell: bash
+        env:
+          INSTANCE_ID_INPUT: ${{ inputs.instance_id }}
         run: |
           set -euo pipefail
-          IID="${{ github.event.inputs.instance_id }}"
-          if [ -z "$IID" ]; then
+          IID="${INSTANCE_ID_INPUT:-}"
+          if [ -z "$IID" ] || [ "$IID" = "None" ]; then
             IID=$(aws ssm describe-instance-information \
               --filters "Key=PingStatus,Values=Online" "Key=PlatformType,Values=Linux" \
               --query 'InstanceInformationList[0].InstanceId' --output text || true)
           fi
           if [ -z "$IID" ] || [ "$IID" = "None" ]; then
-            echo "No SSM Online instance found. Set workflow input 'instance_id' or repo var." >&2
+            echo "No SSM Online instance found and no instance_id provided." >&2
             exit 1
           fi
           echo "iid=$IID" >> "$GITHUB_OUTPUT"
 
-      - name: Build remote script and stage to S3 (avoid 8KB SSM limit)
-        id: build
-        shell: bash
+      - name: Build and stage remote script (2-pass: before & after)
+        id: stage
         env:
-          REGION: ${{ env.AWS_REGION }}
+          IID: ${{ steps.resolve.outputs.iid }}
         run: |
           set -euo pipefail
-          RUN=$(date -u +%Y%m%dT%H%M%SZ)
+          RUN="$(date -u +%Y%m%dT%H%M%SZ)"
           echo "run=$RUN" >> "$GITHUB_OUTPUT"
 
           cat > remote.sh <<'EOS'
@@ -83,242 +78,223 @@ jobs:
 
           BUCKET="${BUCKET}"
           REGION="${REGION}"
-          PHASE="${PHASE}"
           RUN="${RUN}"
 
-          # ---- tools (best-effort) ----
+          # --- Install dependencies (best-effort) ---
           sudo dnf -y install lynis openscap openscap-scanner scap-security-guide jq python3 || \
           sudo yum -y install lynis openscap openscap-scanner scap-security-guide jq python3 || true
           sudo dnf -y install ansible-core || sudo yum -y install ansible-core || python3 -m pip install --user --upgrade ansible
 
-          # ---- helpers ----
+          # --- Helpers ---
           find_ds() {
-            for p in \
-              /usr/share/xml/scap/ssg/ssg-al2023-ds.xml \
-              /usr/share/xml/scap/ssg/ssg-amazon_linux_2-ds.xml \
-              /usr/share/xml/scap/ssg/content/ssg-al2023-ds.xml \
-              /usr/share/xml/scap/ssg/content/ssg-amazon_linux_2-ds.xml ; do
-              [ -f "$p" ] && { echo "$p"; return; }
+            for p in /usr/share/xml/scap/ssg/ssg-al2023-ds.xml \
+                     /usr/share/xml/scap/ssg/ssg-amazon_linux_2-ds.xml ; do
+              test -f "$p" && { echo "$p"; return; }
             done
-            find /usr/share/xml/scap/ssg /usr/share/xml/scap/ssg/content -maxdepth 1 -type f -name 'ssg-*-ds.xml' -print -quit 2>/dev/null || true
+            find /usr/share/xml/scap/ssg -maxdepth 1 -type f -name 'ssg-*-ds.xml' -print -quit 2>/dev/null || true
           }
 
-          cat >/tmp/summarize_json.py <<'PY'
-          import json, os, re, sys
-          from datetime import datetime, timezone
-
-          def read(p):
-              try: return open(p, encoding="utf-8", errors="ignore").read()
-              except: return ""
-
-          def idx(t: str) -> int:
-              m = re.search(r'hardening[_ ]index[^0-9]*([0-9]{1,3})', t, re.I)
-              if m: return int(m.group(1))
-              m = re.search(r'\bHARDENING_INDEX=(\d{1,3})\b', t)
-              return int(m.group(1)) if m else 0
-
-          def score(x: str) -> float:
-              m = re.search(r'<score[^>]*>\s*([0-9]+(?:\.[0-9]+)?)\s*</score>', x, re.I)
-              if m: return float(m.group(1))
-              m = re.search(r'score=["\']([0-9]+(?:\.[0-9]+)?)["\']', x, re.I)
-              if m: return float(m.group(1))
-              passed = len(re.findall(r'<result>\s*pass\s*</result>', x, re.I))
-              total  = len(re.findall(r'<result>.*?</result>', x, re.I))
-              return round((passed/total)*100, 2) if total else 0.0
-
-          stage, root = sys.argv[1], sys.argv[2]
-          lrep  = os.path.join(root, "lynis-report.dat")
-          oxml  = os.path.join(root, "openscap-results.xml")
-
-          data = {
-              "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-              "hostname": os.uname().nodename,
-              "instance_id": os.popen("curl -s http://169.254.169.254/latest/meta-data/instance-id").read().strip(),
-              "region": os.environ.get("REGION",""),
-              "bucket": os.environ.get("BUCKET",""),
-              "run_id": os.environ.get("RUN",""),
-              "stage": stage,
-              "lynis_hardening_index": idx(read(lrep)),
-              "openscap_score": score(read(oxml)),
-          }
-          print(json.dumps(data))
-          PY
-
-          run_scan () {
-            local STAGE="$1"
-            local DIR="/tmp/reports/${STAGE}"
-            mkdir -p "$DIR"
+          run_scans() {
+            stage="$1"; out="/tmp/reports/$stage"; mkdir -p "$out"
 
             # Lynis
             lynis audit system --nocolors --quick \
-              --logfile "${DIR}/lynis.log" \
-              --report-file "${DIR}/lynis-report.dat" || true
+              --logfile "$out/lynis.log" \
+              --report-file "$out/lynis-report.dat" || true
 
-            # OpenSCAP (best-effort)
+            # OpenSCAP if content present
             DS="$(find_ds || true)"
             if [ -n "${DS:-}" ] && [ -f "$DS" ]; then
-              PROF="$(oscap info "$DS" | awk '/^ *Profile/{print $2}' | grep -E 'cis|stig|standard' | head -1 || true)"
-              [ -z "$PROF" ] && PROF="$(oscap info "$DS" | awk '/^ *Profile/{print $2}' | head -1 || true)"
+              PROF="$(oscap info "$DS" | awk '/^ *Profile/{print $2}' | head -1 || true)"
               oscap xccdf eval --fetch-remote-resources \
-                --results "${DIR}/openscap-results.xml" \
-                --report  "${DIR}/openscap-report.html" \
+                --results "$out/openscap-results.xml" \
+                --report  "$out/openscap-report.html" \
                 ${PROF:+--profile "$PROF"} \
                 "$DS" || true
             else
-              : > "${DIR}/openscap-results.xml"
-              echo "<html>No SSG content found on this AMI</html>" > "${DIR}/openscap-report.html"
+              : > "$out/openscap-results.xml"
+              echo "<!-- no SSG content on this AMI -->" > "$out/openscap-report.html"
             fi
 
-            # Summarize to stdout
-            python3 /tmp/summarize_json.py "$STAGE" "$DIR"
+            # Summarize -> summary.json
+            python3 - "$out/lynis-report.dat" "$out/openscap-results.xml" "$out/summary.json" <<'PY'
+import json, re, sys
+def read(p):
+    try: return open(p, encoding="utf-8", errors="ignore").read()
+    except: return ""
+def idx(t):
+    m=re.search(r'hardening[_ ]index[^0-9]*([0-9]{1,3})', t, re.I)
+    return int(m.group(1)) if m else 0
+def score_xml(x):
+    m=re.search(r'<score[^>]*>([0-9]+(?:\.[0-9]+)?)</score>', x, re.I)
+    if m:
+        v=float(m.group(1))
+        return round(v*100,2) if 0<=v<=1 else round(v,2)
+    return 0.0
+lynis = read(sys.argv[1])
+oscap = read(sys.argv[2])
+data = {"lynis_hardening_index": idx(lynis), "openscap_score": score_xml(oscap)}
+open(sys.argv[3], "w").write(json.dumps(data))
+print(json.dumps(data))
+PY
 
-            # Upload artifacts
-            for f in lynis-report.dat lynis.log openscap-report.html openscap-results.xml; do
-              [ -f "${DIR}/$f" ] && aws s3 cp "${DIR}/$f" "s3://${BUCKET}/${RUN}/${PHASE}/${STAGE}/$f" --region "${REGION}" || true
+            # Upload stage artifacts
+            for f in lynis-report.dat lynis.log openscap-report.html openscap-results.xml summary.json; do
+              [ -f "$out/$f" ] && \
+                aws s3 cp "$out/$f" "s3://$BUCKET/$RUN/demo/$stage/$f" --region "$REGION" || true
             done
           }
 
-          echo '---SUMMARY-BEFORE---'
-          run_scan before
-          echo '---END-SUMMARY---'
+          # BEFORE pass
+          run_scans before
 
-          # Minimal hardening between scans (idempotent)
-          sudo sed -i -E 's/^\s*#?\s*PermitRootLogin\s+.*/PermitRootLogin no/' /etc/ssh/sshd_config || true
-          sudo systemctl restart sshd || true
+          # Minimal hardening between passes (tiny, safe changes)
+          if command -v ansible-playbook >/dev/null 2>&1; then
+            cat >/tmp/minihardening.yml <<'YAML'
+- hosts: localhost
+  connection: local
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Disable SSH root login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*PermitRootLogin\s+.*'
+        line: 'PermitRootLogin no'
+        backup: yes
+      notify: restart sshd
+    - name: Ensure fail2ban present (best-effort)
+      package:
+        name: fail2ban
+        state: present
+      ignore_errors: yes
+  handlers:
+    - name: restart sshd
+      service: { name: sshd, state: restarted }
+YAML
+            ansible-playbook -i "localhost," -c local --become /tmp/minihardening.yml || true
+          fi
 
-          echo '---SUMMARY-AFTER---'
-          run_scan after
-          echo '---END-SUMMARY---'
+          # AFTER pass
+          run_scans after
 
-          # Keep "latest" alias up-to-date
-          aws s3 sync "s3://${BUCKET}/${RUN}/" "s3://${BUCKET}/latest/" --delete --region "${REGION}" || true
+          # Keep a /latest/ copy
+          aws s3 sync "s3://$BUCKET/$RUN/" "s3://$BUCKET/latest/" --delete --region "$REGION" || true
+
+          # Emit both summaries for runner to capture
+          echo '---SUMMARY-BEFORE---'; cat /tmp/reports/before/summary.json || true; echo '---END-BEFORE---'
+          echo '---SUMMARY-AFTER---';  cat /tmp/reports/after/summary.json  || true; echo '---END-AFTER---'
           EOS
-          chmod +x remote.sh
 
+          chmod +x remote.sh
           KEY="ci-scripts/${RUN}/remote.sh"
-          aws s3 cp remote.sh "s3://${BUCKET}/${KEY}" --region "${REGION}"
+          aws s3 cp remote.sh "s3://${BUCKET}/${KEY}" --region "${AWS_REGION}"
           echo "key=${KEY}" >> "$GITHUB_OUTPUT"
 
       - name: Send SSM command (download & execute remote script)
         id: ssm
-        shell: bash
         env:
-          RUN: ${{ steps.build.outputs.run }}
-          KEY: ${{ steps.build.outputs.key }}
           IID: ${{ steps.resolve.outputs.iid }}
+          RUN: ${{ steps.stage.outputs.run }}
+          KEY: ${{ steps.stage.outputs.key }}
         run: |
           set -euo pipefail
           CMD_ID=$(aws ssm send-command \
             --document-name "AWS-RunShellScript" \
             --instance-ids "$IID" \
             --comment "Compliance scan $RUN" \
-            --parameters commands="aws s3 cp s3://$BUCKET/$KEY /tmp/remote.sh --region $AWS_REGION && sudo env BUCKET=$BUCKET REGION=$AWS_REGION PHASE=$PHASE RUN=$RUN bash /tmp/remote.sh" \
+            --parameters commands="aws s3 cp s3://$BUCKET/$KEY /tmp/remote.sh --region $AWS_REGION && sudo env BUCKET=$BUCKET REGION=$AWS_REGION RUN=$RUN bash /tmp/remote.sh" \
             --query "Command.CommandId" --output text)
           echo "cmd_id=$CMD_ID" >> "$GITHUB_OUTPUT"
 
-          # Wait up to 5 minutes
+          # Wait for completion
           STATUS=""
-          for _ in $(seq 1 60); do
+          for _ in $(seq 1 90); do
             STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --query Status --output text || true)
             [[ "$STATUS" =~ ^(Success|Failed|Cancelled|TimedOut)$ ]] && break
             sleep 5
           done
-          if [ "$STATUS" != "Success" ]; then
-            echo "::error::SSM command ended with status: $STATUS"
-            aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --output json | jq -r '.StandardErrorContent' | tail -n 200 || true
-            exit 1
-          fi
+          test "$STATUS" = "Success" || { echo "::error::SSM command ended with status: $STATUS"; exit 1; }
 
+          # Pull stdout and extract the summaries
           aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --output json > out.json
           jq -r '.StandardOutputContent' out.json > stdout.txt
-
-          awk '/---SUMMARY-BEFORE---/{f=1;next}/---END-SUMMARY---/{f=0}f' stdout.txt > summary.before.json
-          awk '/---SUMMARY-AFTER---/{f=1;next}/---END-SUMMARY---/{f=0}f'  stdout.txt > summary.after.json
-
-          jq . summary.before.json >/dev/null 2>&1 || echo '{"lynis_hardening_index":0,"openscap_score":0,"stage":"before"}' > summary.before.json
-          jq . summary.after.json  >/dev/null 2>&1 || echo '{"lynis_hardening_index":0,"openscap_score":0,"stage":"after"}'  > summary.after.json
-
-          echo "Before:"; jq -c . summary.before.json || true
-          echo "After :" ; jq -c . summary.after.json  || true
+          awk '/---SUMMARY-BEFORE---/{f=1;next}/---END-BEFORE---/{f=0}f' stdout.txt > summary-before.json || true
+          awk '/---SUMMARY-AFTER---/{f=1;next}/---END-AFTER---/{f=0}f'   stdout.txt > summary-after.json  || true
 
       - name: Emit CloudWatch metrics (before & after; Run and latest)
-        shell: bash
         env:
-          RUN: ${{ steps.build.outputs.run }}
           IID: ${{ steps.resolve.outputs.iid }}
+          RUN: ${{ steps.stage.outputs.run }}
         run: |
           set -euo pipefail
-          L_B=$(jq -r 'try (.lynis_hardening_index|tonumber) catch 0' summary.before.json 2>/dev/null || echo 0)
-          O_B=$(jq -r 'try (.openscap_score|tonumber)          catch 0' summary.before.json 2>/dev/null || echo 0)
-          L_A=$(jq -r 'try (.lynis_hardening_index|tonumber) catch 0' summary.after.json  2>/dev/null || echo 0)
-          O_A=$(jq -r 'try (.openscap_score|tonumber)          catch 0' summary.after.json  2>/dev/null || echo 0)
+          # Safe numeric coercion
+          B_LHI=$(jq -r 'try (.lynis_hardening_index|tonumber) catch 0' summary-before.json 2>/dev/null || echo 0)
+          A_LHI=$(jq -r 'try (.lynis_hardening_index|tonumber) catch 0' summary-after.json  2>/dev/null || echo 0)
+          B_OSC=$(jq -r 'try (.openscap_score|tonumber)       catch 0' summary-before.json 2>/dev/null || echo 0)
+          A_OSC=$(jq -r 'try (.openscap_score|tonumber)       catch 0' summary-after.json  2>/dev/null || echo 0)
 
-          echo "LYNIS before=$L_B after=$L_A | OSCAP before=$O_B after=$O_A | IID=$IID RUN=$RUN"
+          ts="$(date -u +%FT%TZ)"
+          build_payload() {
+            local run="$1"
+            jq -n --arg iid "$IID" --arg run "$run" \
+              --argjson bl "$B_LHI" --argjson al "$A_LHI" \
+              --argjson bo "$B_OSC" --argjson ao "$A_OSC" \
+              '[
+                {"MetricName":"LynisHardeningIndex","Value":$bl,"Unit":"Count","Timestamp":"'"$ts"'",
+                 "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":$run},{"Name":"Stage","Value":"before"}]},
+                {"MetricName":"LynisHardeningIndex","Value":$al,"Unit":"Count","Timestamp":"'"$ts"'",
+                 "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":$run},{"Name":"Stage","Value":"after"}]},
+                {"MetricName":"OpenSCAPScore","Value":$bo,"Unit":"Percent","Timestamp":"'"$ts"'",
+                 "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":$run},{"Name":"Stage","Value":"before"}]},
+                {"MetricName":"OpenSCAPScore","Value":$ao,"Unit":"Percent","Timestamp":"'"$ts"'",
+                 "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":$run},{"Name":"Stage","Value":"after"}]},
+                {"MetricName":"Status","Value":1,"Unit":"Count","Timestamp":"'"$ts"'",
+                 "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":$run}]}
+              ]'
+          }
+          build_payload "$RUN"   > metrics-run.json
+          build_payload "latest" > metrics-latest.json
 
-          jq -n \
-            --arg iid "$IID" \
-            --arg run "$RUN" \
-            --argjson l_b ${L_B:-0} --argjson o_b ${O_B:-0} \
-            --argjson l_a ${L_A:-0} --argjson o_a ${O_A:-0} '
-          [
-            {"MetricName":"LynisHardeningIndex","Value":$l_b,"Unit":"Count",
-             "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":$run},{"Name":"Stage","Value":"before"}]},
-            {"MetricName":"OpenSCAPScore","Value":$o_b,"Unit":"Percent",
-             "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":$run},{"Name":"Stage","Value":"before"}]},
+          echo "=== Metrics (Run) ===";     jq . metrics-run.json
+          echo "=== Metrics (latest) ===";  jq . metrics-latest.json
 
-            {"MetricName":"LynisHardeningIndex","Value":$l_a,"Unit":"Count",
-             "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":$run},{"Name":"Stage","Value":"after"}]},
-            {"MetricName":"OpenSCAPScore","Value":$o_a,"Unit":"Percent",
-             "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":$run},{"Name":"Stage","Value":"after"}]},
-
-            {"MetricName":"LynisHardeningIndex","Value":$l_b,"Unit":"Count",
-             "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":"latest"},{"Name":"Stage","Value":"before"}]},
-            {"MetricName":"OpenSCAPScore","Value":$o_b,"Unit":"Percent",
-             "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":"latest"},{"Name":"Stage","Value":"before"}]},
-
-            {"MetricName":"LynisHardeningIndex","Value":$l_a,"Unit":"Count",
-             "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":"latest"},{"Name":"Stage","Value":"after"}]},
-            {"MetricName":"OpenSCAPScore","Value":$o_a,"Unit":"Percent",
-             "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":"latest"},{"Name":"Stage","Value":"after"}]},
-
-            {"MetricName":"Status","Value":1,"Unit":"Count",
-             "Dimensions":[{"Name":"InstanceId","Value":$iid},{"Name":"Run","Value":$run},{"Name":"Stage","Value":"after"}]}
-          ]' > metrics.json
-
-          echo "Metric payload:"; jq . metrics.json || true
-          aws cloudwatch put-metric-data --namespace "${NAMESPACE}" --metric-data file://metrics.json
+          aws cloudwatch put-metric-data --namespace "ComplianceMetrics" --metric-data file://metrics-run.json
+          aws cloudwatch put-metric-data --namespace "ComplianceMetrics" --metric-data file://metrics-latest.json
 
       - name: Publish CloudWatch dashboard (best-effort)
-        if: hashFiles('scripts/publish-cloudwatch-dashboard.sh') != ''
-        shell: bash
+        if: ${{ inputs.publish_dashboard }}
         env:
+          REGION: ${{ inputs.region }}
           IID: ${{ steps.resolve.outputs.iid }}
         run: |
           set -euo pipefail
-          REGION="${AWS_REGION}" IID="${IID}" ./scripts/publish-cloudwatch-dashboard.sh || true
+          if [ -f scripts/publish-cloudwatch-dashboard.sh ]; then
+            bash scripts/publish-cloudwatch-dashboard.sh || true
+          else
+            echo "Dashboard script not found; skipping."
+          fi
 
       - name: Upload diagnostics (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: compliance-${{ steps.build.outputs.run }}
+          name: compliance-${{ steps.stage.outputs.run }}
           path: |
-            summary.before.json
-            summary.after.json
-            metrics.json
+            summary-before.json
+            summary-after.json
+            metrics-run.json
+            metrics-latest.json
             out.json
             stdout.txt
 
       - name: Output links
-        shell: bash
-        env:
-          RUN: ${{ steps.build.outputs.run }}
         run: |
           set -euo pipefail
           echo "Artifacts (S3 paths):"
-          echo "  s3://$BUCKET/${RUN}/"
-          echo "  s3://$BUCKET/latest/"
+          echo "  s3://${BUCKET}/${{ steps.stage.outputs.run }}/"
+          echo "  s3://${BUCKET}/latest/"
           echo
-          echo "If the bucket is fronted by S3 static website hosting, try:"
-          echo "  http://$BUCKET.s3-website-${AWS_REGION}.amazonaws.com/${RUN}/"
-          echo "  http://$BUCKET.s3-website-${AWS_REGION}.amazonaws.com/latest/"
+          echo "If the bucket has static website hosting, try:"
+          echo "  http://${BUCKET}.s3-website-${AWS_REGION}.amazonaws.com/${{ steps.stage.outputs.run }}/"
+          echo "  http://${BUCKET}.s3-website-${AWS_REGION}.amazonaws.com/latest/"
 
